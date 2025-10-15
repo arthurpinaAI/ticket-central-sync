@@ -32,7 +32,8 @@ jobs:
           ALL_TAB:                    ${{ secrets.ALL_TAB }}
           LI_TAB:                     ${{ secrets.LI_TAB }}
           # Tuning (optional)
-          CHUNK_SIZE: "20"
-          SOFT_TIME_LIMIT_S: "270"
+          CHUNK_SIZE: "999999"
+          SOFT_TIME_LIMIT_S: "3300"
+          DEBUG: "1"
         run: |
           python sync.py
