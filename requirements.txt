@@ -1,0 +1,5 @@
+gspread==6.1.4
+google-auth==2.35.0
+google-auth-oauthlib==1.2.1
+google-api-python-client==2.151.0
+python-dateutil==2.9.0.post0
