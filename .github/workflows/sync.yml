@@ -1,10 +1,10 @@
-name: Ticket Central Sync (tail-window, tail-keys)
+name: Ticket Central Sync (writeback dedupe)
 
 on:
   workflow_dispatch:
     inputs:
       startFromNow:
-        description: "Baseline current tail rows into per-source keys (skip history this run)"
+        description: "Stamp sync flags now (skip history this run)"
         required: false
         default: "false"
   schedule:
@@ -36,13 +36,14 @@ jobs:
           MASTER_SPREADSHEET_ID: ${{ secrets.MASTER_SPREADSHEET_ID }}
           MASTER_TICKETS_TAB: ${{ vars.MASTER_TICKETS_TAB || 'Tickets' }}
           MASTER_SOURCE_TAB:  ${{ vars.MASTER_SOURCE_TAB  || 'Source'  }}
-          # Tunables (safe defaults)
           TAIL_WINDOW_ROWS: "3000"
-          KEYS_TAIL: "5000"
           PAGE_ROWS: "3000"
           BATCH_APPEND_ROWS: "500"
           BACKOFF_BASE_SEC: "0.8"
           BACKOFF_MAX_SEC: "6.0"
           START_FROM_NOW: ${{ github.event.inputs.startFromNow || 'false' }}
+          # Optional: choose where to place the sync flag
+          SYNC_COL_ALL: "30"
+          SYNC_COL_LI:  "30"
         run: |
           python sync.py
