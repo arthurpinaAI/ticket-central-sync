@@ -32,6 +32,7 @@ jobs:
           ALL_TAB:                    ${{ secrets.ALL_TAB }}
           LI_TAB:                     ${{ secrets.LI_TAB }}
           # Tuning (optional)
+          TEST_WRITE: "1"
           CHUNK_SIZE: "999999"
           SOFT_TIME_LIMIT_S: "3300"
           DEBUG: "1"
