@@ -321,6 +321,16 @@ def main():
         print(f"[OK] Added: ALL={added_all}, LI={added_li} | Sources processed: ALL={done_all}, LI={done_li}")
     else:
         print(f"[OK] Added: ALL={added_all} | Sources processed: ALL={done_all} | (LI skipped due to time)")
+def test_write():
+    ws = ensure_master_tab(MASTER_SPREADSHEET_ID, MASTER_TAB)
+    append_rows(MASTER_SPREADSHEET_ID, MASTER_TAB, [["SYNC_TEST", time.strftime("%Y-%m-%d %H:%M:%S")]])
+    print("[TEST] Wrote a SYNC_TEST row to Master.")
 
 if __name__ == "__main__":
-    main()
+    if os.environ.get("TEST_WRITE") == "1":
+        test_write()
+    elif os.environ.get("INIT_MARKERS_NOW") == "1":
+        init_markers_now()
+    else:
+        main()
+
