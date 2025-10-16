@@ -1,10 +1,10 @@
-name: Ticket Central Sync (per-source keys, tail window)
+name: Ticket Central Sync (tail-window, tail-keys)
 
 on:
   workflow_dispatch:
     inputs:
       startFromNow:
-        description: "Baseline current rows in each source (__SyncedKeys_*), skip history this run"
+        description: "Baseline current tail rows into per-source keys (skip history this run)"
         required: false
         default: "false"
   schedule:
@@ -36,8 +36,9 @@ jobs:
           MASTER_SPREADSHEET_ID: ${{ secrets.MASTER_SPREADSHEET_ID }}
           MASTER_TICKETS_TAB: ${{ vars.MASTER_TICKETS_TAB || 'Tickets' }}
           MASTER_SOURCE_TAB:  ${{ vars.MASTER_SOURCE_TAB  || 'Source'  }}
-          # Tail window and batching (defaults are safe)
+          # Tunables (safe defaults)
           TAIL_WINDOW_ROWS: "3000"
+          KEYS_TAIL: "5000"
           PAGE_ROWS: "3000"
           BATCH_APPEND_ROWS: "500"
           BACKOFF_BASE_SEC: "0.8"
