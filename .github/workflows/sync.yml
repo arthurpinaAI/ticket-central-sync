@@ -1,41 +1,48 @@
 name: Ticket Central Sync
 
 on:
+  workflow_dispatch:
+    inputs:
+      initFromNow:
+        description: "Skip all history for new sources (true/false)"
+        required: false
+        default: "false"
+      chunkRows:
+        description: "Rows to scan per source per run"
+        required: false
+        default: "800"
+      timeBudgetSec:
+        description: "Seconds per run before safe exit"
+        required: false
+        default: "330"
   schedule:
-    - cron: "30 21 * * *"  # 02:30 IST daily (UTC cron)
-  workflow_dispatch: {}     # allow manual run
+    # frequent small runs = reliable continuation
+    - cron: "*/10 * * * *"
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
+            python-version: "3.11"
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
       - name: Run sync
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          MASTER_SPREADSHEET_ID:      ${{ secrets.MASTER_SPREADSHEET_ID }}
-          MASTER_TAB:                 ${{ secrets.MASTER_TAB }}
-          SOURCE_SPREADSHEET_ID:      ${{ secrets.SOURCE_SPREADSHEET_ID }}
-          SOURCE_TAB:                 ${{ secrets.SOURCE_TAB }}
-          ALL_TAB:                    ${{ secrets.ALL_TAB }}
-          LI_TAB:                     ${{ secrets.LI_TAB }}
-          # Tuning (optional)
-          MASTER_HEADER_ROWS: "3"
-          TEST_WRITE: "1"
-          CHUNK_SIZE: "999999"
-          SOFT_TIME_LIMIT_S: "3300"
-          DEBUG: "1"
+          MASTER_SPREADSHEET_ID: ${{ secrets.MASTER_SPREADSHEET_ID }}
+          MASTER_TICKETS_TAB: ${{ vars.MASTER_TICKETS_TAB || 'Tickets' }}
+          MASTER_SOURCE_TAB:  ${{ vars.MASTER_SOURCE_TAB  || 'Source'  }}
+          __MARKERS_TAB_NAME: ${{ vars.MARKERS_TAB_NAME   || '__Markers' }}
+          INIT_FROM_NOW: ${{ github.event.inputs.initFromNow || 'false' }}
+          CHUNK_ROWS: ${{ github.event.inputs.chunkRows || '800' }}
+          TIME_BUDGET_SEC: ${{ github.event.inputs.timeBudgetSec || '330' }}
         run: |
           python sync.py
