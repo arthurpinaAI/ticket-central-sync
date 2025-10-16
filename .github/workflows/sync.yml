@@ -38,11 +38,17 @@ jobs:
           MASTER_SPREADSHEET_ID: ${{ secrets.MASTER_SPREADSHEET_ID }}
           MASTER_TICKETS_TAB: ${{ vars.MASTER_TICKETS_TAB || 'Tickets' }}
           MASTER_SOURCE_TAB: ${{ vars.MASTER_SOURCE_TAB || 'Source' }}
-          TAIL_WINDOW_ROWS: "3000"
-          PAGE_ROWS: "3000"
+          TAIL_WINDOW_ROWS: "2000"
+          THROTTLE_MS_PER_READ: "250"        # sleep 0.25s after each range GET
+          SLEEP_BETWEEN_SOURCES_MS: "1000"   # sleep 1s after each source
+          SLEEP_BETWEEN_FLOWS_MS: "3000"     # sleep 3s between ALL and LI passes
+# Optional source sharding (split across multiple runs if needed)
+          TOTAL_SHARDS: "1"                  # set to 2 or 3 to split sources
+          SHARD_INDEX: "0"                   # 0..TOTAL_SHARDS-1; run different shards at different times
+          PAGE_ROWS: "100000"
           BATCH_APPEND_ROWS: "500"
-          BACKOFF_BASE_SEC: "0.8"
-          BACKOFF_MAX_SEC: "6.0"
+          BACKOFF_BASE_SEC: "2.0"
+          BACKOFF_MAX_SEC: "20.0"
           START_FROM_NOW: ${{ github.event.inputs.startFromNow || 'false' }}
           SYNC_COL_ALL: "30"
           SYNC_COL_LI: "30"
