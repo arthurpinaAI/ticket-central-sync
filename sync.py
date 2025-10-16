@@ -86,6 +86,41 @@ def get_ws(ss: gspread.Spreadsheet, title: str):
         return ss.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
         return None
+import random
+from gspread.exceptions import APIError
+
+RETRYABLE_SNIPPETS = ("[503]", "backendError", "internal", "service is currently unavailable")
+
+def open_spreadsheet_safe(gc, key, retries=6, base=0.8, cap=12.0):
+    delay = base
+    for _ in range(retries):
+        try:
+            return gc.open_by_key(key)
+        except APIError as e:
+            msg = str(e).lower()
+            if any(x.lower() in msg for x in RETRYABLE_SNIPPETS):
+                time.sleep(delay + random.random() * 0.5)
+                delay = min(delay * 2, cap)
+                continue
+            raise
+    # last attempt
+    return gc.open_by_key(key)
+
+def get_ws_safe(ss, title, retries=6, base=0.8, cap=12.0):
+    delay = base
+    for _ in range(retries):
+        try:
+            return ss.worksheet(title)
+        except gspread.exceptions.WorksheetNotFound:
+            return None
+        except APIError as e:
+            msg = str(e).lower()
+            if any(x.lower() in msg for x in RETRYABLE_SNIPPETS):
+                time.sleep(delay + random.random() * 0.5)
+                delay = min(delay * 2, cap)
+                continue
+            raise
+    return ss.worksheet(title)
 
 def ensure_sheet_size(ws, min_rows: int, min_cols: int):
     if ws.row_count < min_rows or ws.col_count < min_cols:
@@ -164,8 +199,9 @@ def process_flow_for_source(
             TAB_LI, START_ROW_LI, REQ_LI, MAP_LI, STATIC_LI, SYNC_COL_LI, "__SYNCED_LI"
         )
 
-    ss = gc.open_by_key(spreadsheet_id)
-    ws = get_ws(ss, tab)
+   ss = open_spreadsheet_safe(gc, spreadsheet_id)
+ws = get_ws_safe(ss, tab)
+
     if ws is None:
         print(f"[{flow}] {spreadsheet_id}: tab '{tab}' not found — skipping.")
         return 0, 0
