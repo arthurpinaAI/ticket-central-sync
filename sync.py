@@ -120,7 +120,7 @@ def write_marker(markers_ws, key, value):
     ts = _now_utc_iso()
     if key in key_to_row:
         row = key_to_row[key]
-        markers_ws.update(f"A{row}:C{row}", [[key, str(value), ts]])
+        markers_ws.update(values=[[key, str(value), ts]], range_name=f"A{row}:C{row}")
     else:
         markers_ws.append_row([key, str(value), ts], value_input_option="RAW")
 
@@ -188,13 +188,23 @@ def map_row_to_master(row, mapping, static_map, master_width):
     return out
 
 def read_rows_window(ws, start_row, max_col, from_row_inclusive, limit_rows):
-    to_row = from_row_inclusive + limit_rows - 1
-    rng = f"A{from_row_inclusive}:{gspread.utils.rowcol_to_a1(1, max_col).split('1')[0]}{to_row}"
-    # The above build for columns: simpler: use gspread's a1_range utility
-    rng = f"{gspread.utils.rowcol_to_a1(from_row_inclusive,1)}:{gspread.utils.rowcol_to_a1(to_row,max_col)}"
+    """
+    Read a bounded window of rows, clamped to the sheet grid size.
+    Returns (absolute_row_numbers, values_list).
+    """
+    sheet_max_rows = ws.row_count
+    if from_row_inclusive > sheet_max_rows:
+        return [], []  # nothing to read
+
+    to_row = min(from_row_inclusive + limit_rows - 1, sheet_max_rows)
+    if to_row < from_row_inclusive:
+        return [], []
+
+    rng = f"{gspread.utils.rowcol_to_a1(from_row_inclusive, 1)}:{gspread.utils.rowcol_to_a1(to_row, max_col)}"
     vals = ws.get(rng)  # list of lists
-    base_row_numbers = list(range(from_row_inclusive, to_row+1))
+    base_row_numbers = list(range(from_row_inclusive, to_row + 1))
     return base_row_numbers, vals
+
 
 def highest_needed_col(mapping, required_cols, static_map):
     """
