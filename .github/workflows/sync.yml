@@ -1,9 +1,14 @@
-name: Ticket Central Sync (Zapier style, edit-safe)
+name: Ticket Central Sync (Zapier composite-key)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      startFromNow:
+        description: "Baseline current rows as 'seen' (skip history this run)"
+        required: false
+        default: "false"
   schedule:
-    # 01:00 Asia/Kolkata (19:30 UTC previous day)
+    # 01:00 Asia/Kolkata == 19:30 UTC previous day
     - cron: "30 19 * * *"
 
 jobs:
@@ -21,7 +26,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Run sync (Zapier-style full sweep)
+      - name: Run sync (one-shot)
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           MASTER_SPREADSHEET_ID: ${{ secrets.MASTER_SPREADSHEET_ID }}
@@ -29,13 +34,12 @@ jobs:
           MASTER_SOURCE_TAB:  ${{ vars.MASTER_SOURCE_TAB  || 'Source'  }}
           __MARKERS_TAB_NAME: ${{ vars.MARKERS_TAB_NAME   || '__Markers' }}
           __KEYINDEX_TAB_NAME: ${{ vars.__KEYINDEX_TAB_NAME || '__KeyIndex' }}
-          # Optional knobs (defaults are fine)
+          # Optional tuning
           PAGE_ROWS: "5000"
           BATCH_APPEND_ROWS: "500"
           BACKOFF_BASE_SEC: "0.8"
           BACKOFF_MAX_SEC: "6.0"
-          # Choose stable ID columns if NOT Column A:
-          # IDCOL_ALL: "1"
-          # IDCOL_LI:  "1"
+          # Start-now flag (true only for the very first run you want to skip history)
+          START_FROM_NOW: ${{ github.event.inputs.startFromNow || 'false' }}
         run: |
           python sync.py
