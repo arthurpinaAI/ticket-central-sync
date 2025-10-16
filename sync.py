@@ -33,10 +33,9 @@ MASTER_SOURCE_TAB     = os.getenv("MASTER_SOURCE_TAB",  "Source")
 MARKERS_TAB_NAME      = os.getenv("__MARKERS_TAB_NAME", "__Markers")
 KEYINDEX_TAB_NAME     = os.getenv("__KEYINDEX_TAB_NAME","__KeyIndex")
 
-# Stable ID column (1-based index). Default = 1 (Column A)
-# If you want to dedupe by a different column, change this to that column index.
-IDCOL_ALL = int(os.getenv("IDCOL_ALL", "1"))  # ALL flow ID column (default A)
-IDCOL_LI  = int(os.getenv("IDCOL_LI",  "1"))  # LI  flow ID column (default A)
+# Composite-key columns (1-based): use required columns
+KEYCOLS_ALL = [2, 3]        # B + C
+KEYCOLS_LI  = [2, 3, 4]     # B + C + D
 
 # Page/batch sizes (tune if needed)
 PAGE_ROWS         = int(os.getenv("PAGE_ROWS", "5000"))    # rows read per page
@@ -174,6 +173,14 @@ def load_seen_ids(key_ws):
             seen.add(v)
     return seen
 
+def make_composite_key(source_id: str, flow: str, row: list[str], keycols: list[int]) -> str:
+    # Normalize + hash required columns
+    parts = []
+    for idx in keycols:
+        parts.append((row[idx - 1].strip() if idx - 1 < len(row) else ""))
+    basis = f"{source_id}\u241f{flow}\u241f" + "\u241f".join(parts)
+    return hashlib.sha1(basis.encode("utf-8")).hexdigest()
+
 def make_id_key(source_id: str, flow: str, id_value: str) -> str:
     # A compact stable key; id_value is the row's stable ID (e.g., Column A)
     basis = f"{source_id}\u241f{flow}\u241f{id_value.strip()}"
@@ -227,9 +234,10 @@ def process_flow_for_source(gc, tickets_ws, key_ws, markers_ws, master_width,
                             spreadsheet_id, flow):
     # Choose per-flow configs
     if flow == FLOW_ALL:
-        tab = TAB_ALL; start_row = START_ROW_ALL; required = REQ_ALL; mapping = MAP_ALL; statics = {}; idcol = IDCOL_ALL
+    tab = TAB_ALL; start_row = START_ROW_ALL; required = REQ_ALL; mapping = MAP_ALL; statics = {}; keycols = KEYCOLS_ALL
     else:
-        tab = TAB_LI;  start_row = START_ROW_LI; required = REQ_LI; mapping = MAP_LI;  statics = STATIC_LI; idcol = IDCOL_LI
+    tab = TAB_LI;  start_row = START_ROW_LI; required = REQ_LI; mapping = MAP_LI;  statics = STATIC_LI; keycols = KEYCOLS_LI
+
 
     # Open source sheet/tab
     ss = gc.open_by_key(spreadsheet_id)
@@ -267,16 +275,11 @@ def process_flow_for_source(gc, tickets_ws, key_ws, markers_ws, master_width,
             if not valid:
                 continue
 
-            # Stable ID value
-            id_val = row[idcol - 1].strip() if idcol - 1 < len(row) else ""
-            if id_val == "":
-                # No stable ID → skip this row; it cannot be deduped safely
-                continue
+            # Composite key from required columns
+k = make_composite_key(spreadsheet_id, flow, row, keycols)
+if k in seen:
+    continue
 
-            # Composite key: (source_id, flow, id_val)
-            k = make_id_key(spreadsheet_id, flow, id_val)
-            if k in seen:
-                continue
 
             # Map & add
             out = map_row_to_master(row, mapping, statics, master_width)
