@@ -1,32 +1,20 @@
 #!/usr/bin/env python3
 """
-Ticket Central — Zapier/Make-style one-shot sync (per-source keys, tail-window, 429-resistant)
+Ticket Central — Zapier/Make-style one-shot sync
+(per-source tail-window + tail-keys only; 429-resistant; start-now supported)
 
-What it does each run:
-- Reads Master: Source!B2:B (list of source spreadsheet URLs/IDs).
-- For each source, processes two flows/tabs:
-    1) "ALL TICKETS (LIVE)"           (data from row 4; require B,C non-empty)
-    2) "LINKEDIN VIEWS (LIVE)"        (data from row 3; require B,C,D non-empty)
-- Unique row key (per flow) = SHA1 of required columns:
-    ALL  key = B + C
-    LI   key = B + C + D
-- Appends to Master: Tickets once per unique key.
-- Dedupe is stored **in the source sheet itself**:
-    - __SyncedKeys_ALL (A:key) for ALL flow
-    - __SyncedKeys_LI  (A:key) for LI  flow
-  → We only load a tiny per-source key list (no huge central reads).
-- Tail-window scan: only the last TAIL_WINDOW_ROWS rows of each source tab are read.
-- Optional START_FROM_NOW baseline: on first run (with flag), record current window keys
-  into __SyncedKeys_* WITHOUT appending; future runs append only brand-new keys.
+Key ideas:
+- For each source tab we only scan the LAST TAIL_WINDOW_ROWS (default 3000).
+- For dedupe, we only load the LAST KEYS_TAIL rows from the per-source key tab
+  (default 5000), tracked via a tiny "last_row" marker in the header (no full col read).
+- Composite key = required columns:
+    ALL: B + C
+    LI : B + C + D
+- Start-Now mode: record keys (no append) on first run; future runs append only new keys.
 
-Config via env:
-- MASTER_SPREADSHEET_ID (required)
-- MASTER_TICKETS_TAB, MASTER_SOURCE_TAB (defaults "Tickets"/"Source")
-- TAIL_WINDOW_ROWS (default 3000)
-- PAGE_ROWS (default 3000; the code reads the window in 1 page unless very large)
-- BATCH_APPEND_ROWS (default 500)
-- START_FROM_NOW (true/false) — baseline mode per source+flow on first run
-- BACKOFF_BASE_SEC (0.8), BACKOFF_MAX_SEC (6.0)
+Tabs created in EACH source spreadsheet:
+  __SyncedKeys_ALL: A="key", B1="last_row" holding last populated row index (int)
+  __SyncedKeys_LI : same
 """
 
 import os, json, time, re, hashlib
@@ -37,23 +25,24 @@ import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
 
-# ============== CONFIG ==============
+# ====== ENV CONFIG ======
 MASTER_SPREADSHEET_ID = os.environ["MASTER_SPREADSHEET_ID"]
 MASTER_TICKETS_TAB    = os.getenv("MASTER_TICKETS_TAB", "Tickets")
 MASTER_SOURCE_TAB     = os.getenv("MASTER_SOURCE_TAB",  "Source")
 
-# Tail window size (how many latest rows to scan per tab)
-TAIL_WINDOW_ROWS      = int(os.getenv("TAIL_WINDOW_ROWS", "3000"))
+# Tail sizes
+TAIL_WINDOW_ROWS      = int(os.getenv("TAIL_WINDOW_ROWS", "3000"))   # rows to scan in source tab
+KEYS_TAIL             = int(os.getenv("KEYS_TAIL", "5000"))          # how many recent keys to read from keys tab
 
-# Read/write batching
+# Paging & batching
 PAGE_ROWS             = int(os.getenv("PAGE_ROWS", "3000"))
 BATCH_APPEND_ROWS     = int(os.getenv("BATCH_APPEND_ROWS", "500"))
 
-# Backoff for Google rate limits
+# Backoff
 BACKOFF_BASE_SEC      = float(os.getenv("BACKOFF_BASE_SEC", "0.8"))
 BACKOFF_MAX_SEC       = float(os.getenv("BACKOFF_MAX_SEC", "6.0"))
 
-# Start-now (baseline current window keys without appending)
+# Start-Now (baseline) for unseen sources
 START_FROM_NOW        = os.getenv("START_FROM_NOW", "false").lower() in ("1","true","yes")
 
 # Flow/tab names
@@ -68,11 +57,11 @@ START_ROW_LI  = 3  # 2 header rows
 REQ_ALL = [2, 3]       # B, C
 REQ_LI  = [2, 3, 4]    # B, C, D
 
-# Composite-key columns (match required)
+# Composite-key columns (same as required)
 KEYCOLS_ALL = [2, 3]
 KEYCOLS_LI  = [2, 3, 4]
 
-# Mappings to Tickets (1-based)
+# Mappings → Tickets (1-based)
 MAP_ALL = {1:1, 3:2, 10:5, 2:6, 11:7, 12:8, 4:16}
 MAP_LI  = {1:1, 2:6, 3:2, 5:8, 4:3}
 STATIC_LI = {5:"LinkedIn - LX", 7:"DD"}
@@ -80,11 +69,11 @@ STATIC_LI = {5:"LinkedIn - LX", 7:"DD"}
 # Master width (pad at least to this many columns)
 MASTER_WIDTH_MIN = max([*MAP_ALL.values(), *MAP_LI.values(), *STATIC_LI.keys(), 16])
 
-# Per-source keys tab names
+# Per-source key tabs
 KEYTAB_ALL = "__SyncedKeys_ALL"
 KEYTAB_LI  = "__SyncedKeys_LI"
 
-# ============== UTILITIES ==============
+# ====== UTILS ======
 def now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -168,31 +157,57 @@ def make_composite_key(row: List[str], keycols: List[int]) -> str:
         parts.append((row[idx - 1].strip() if idx - 1 < len(row) else ""))
     return hashlib.sha1(("\u241f".join(parts)).encode("utf-8")).hexdigest()
 
-# ============== PER-SOURCE KEYS ==============
+# ====== KEYS TAB (tail-only) ======
 def get_or_create_keys_tab(ss: gspread.Spreadsheet, name: str):
     ws = get_ws(ss, name)
     if ws is None:
-        ws = ss.add_worksheet(name, rows=100, cols=1)
-        ensure_headers(ws, ["key"])  # A1 = key
+        ws = ss.add_worksheet(name, rows=100, cols=2)
+        # A: key, B1: last_row marker
+        ensure_headers(ws, ["key", "last_row"])
+        ws.update(values=[["", "1"]], range_name="A2:B2")  # set initial last_row marker row
     return ws
 
-def load_keys_set(keys_ws) -> Set[str]:
+def get_keys_last_row(keys_ws) -> int:
+    """
+    Read tiny last_row marker from B1 (or B2 fallback).
+    This is a single-cell read, not a full column.
+    """
+    rng = keys_ws.get("B1:B2")  # tiny range; B1 = header, B2 = number cell
+    last_row = 1
+    try:
+        if len(rng) >= 2 and len(rng[1]) >= 1 and rng[1][0].strip():
+            last_row = int(rng[1][0])
+    except Exception:
+        last_row = 1
+    return max(1, last_row)
+
+def set_keys_last_row(keys_ws, last_row: int):
+    keys_ws.update(values=[[str(last_row)]], range_name="B2:B2")
+
+def load_keys_tail(keys_ws, tail: int) -> Set[str]:
+    """
+    Load only the last 'tail' keys using the last_row marker.
+    """
+    last_row = get_keys_last_row(keys_ws)
+    start = max(2, last_row - tail + 1)
+    rng = f"A{start}:A{last_row}"
+    vals = values_get_safe(keys_ws, rng)
     seen = set()
-    col = keys_ws.col_values(1)  # A
-    for i, v in enumerate(col, start=1):
-        if i == 1:  # header
-            continue
-        if v:
-            seen.add(v)
+    for r in vals:
+        if r and r[0]:
+            seen.add(r[0])
     return seen
 
-def append_keys(keys_ws, keys: List[str]):
-    if not keys:
+def append_keys_and_update_marker(keys_ws, new_keys: List[str]):
+    if not new_keys:
         return
-    rows = [[k] for k in keys]
+    start_marker = get_keys_last_row(keys_ws)
+    rows = [[k] for k in new_keys]
     append_rows_safe(keys_ws, rows, "RAW")
+    # Update marker: new last row = old marker + len(added rows)
+    set_keys_last_row(keys_ws, start_marker + len(rows))
 
-# ============== MASTER SOURCE LIST ==============
+# ====== MASTER SOURCE LIST ======
 def get_source_ids(master: gspread.Spreadsheet) -> List[str]:
     ws = master.worksheet(MASTER_SOURCE_TAB)
     col_b = ws.col_values(2)
@@ -204,7 +219,7 @@ def get_source_ids(master: gspread.Spreadsheet) -> List[str]:
             ids.append(parse_sheet_id(v.strip()))
     return ids
 
-# ============== CORE FLOW ==============
+# ====== CORE FLOW ======
 def process_flow_for_source(
     gc: gspread.Client,
     master_tickets,
@@ -222,29 +237,26 @@ def process_flow_for_source(
             TAB_LI, START_ROW_LI, REQ_LI, MAP_LI, STATIC_LI, KEYCOLS_LI, KEYTAB_LI
         )
 
-    # Open source and tabs
     ss = gc.open_by_key(spreadsheet_id)
     ws = get_ws(ss, tab)
     if ws is None:
-        print(f"[{flow}] source {spreadsheet_id}: tab '{tab}' not found — skipping.")
+        print(f"[{flow}] {spreadsheet_id}: tab '{tab}' not found — skipping.")
         return 0, 0
 
     keys_ws = get_or_create_keys_tab(ss, keytab)
-    seen = load_keys_set(keys_ws)
+    seen = load_keys_tail(keys_ws, KEYS_TAIL)
 
     # Tail window bounds
     max_row = ws.row_count
     if max_row < start_row:
         return 0, 0
-
     window_start = max(start_row, max_row - TAIL_WINDOW_ROWS + 1)
     max_col = min(highest_needed_col(mapping, required), ws.col_count)
 
-    # Read the window (usually one call)
     total_appended = 0
     total_scanned  = 0
-    batch_rows = []
-    new_keys_buffer: List[str] = []
+    batch_rows: List[List[str]] = []
+    new_keys_buf: List[str] = []
 
     r = window_start
     while r <= max_row:
@@ -256,7 +268,7 @@ def process_flow_for_source(
             abs_row = r + i
             total_scanned += 1
 
-            # Validate required columns
+            # Validate
             good = True
             for idx in required:
                 if (idx - 1) >= len(row) or str(row[idx - 1]).strip() == "":
@@ -270,37 +282,37 @@ def process_flow_for_source(
                 continue
 
             if START_FROM_NOW:
-                # Baseline mode: remember keys but don't append
-                new_keys_buffer.append(k)
+                # Baseline: store key only
+                new_keys_buf.append(k)
                 seen.add(k)
-                if len(new_keys_buffer) >= BATCH_APPEND_ROWS:
-                    append_keys(keys_ws, new_keys_buffer)
-                    new_keys_buffer.clear()
+                if len(new_keys_buf) >= BATCH_APPEND_ROWS:
+                    append_keys_and_update_marker(keys_ws, new_keys_buf)
+                    new_keys_buf.clear()
                 continue
 
-            # Normal mode: append to master + remember key
+            # Normal: append + remember key
             out = map_row_to_master(row, mapping, statics, master_width)
             batch_rows.append(out)
-            new_keys_buffer.append(k)
+            new_keys_buf.append(k)
             seen.add(k)
 
             if len(batch_rows) >= BATCH_APPEND_ROWS:
                 append_rows_safe(master_tickets, batch_rows, "RAW")
-                append_keys(keys_ws, new_keys_buffer)
+                append_keys_and_update_marker(keys_ws, new_keys_buf)
                 total_appended += len(batch_rows)
                 batch_rows.clear()
-                new_keys_buffer.clear()
+                new_keys_buf.clear()
 
         r = page_end + 1
 
     # Flush remaining
     if START_FROM_NOW:
-        if new_keys_buffer:
-            append_keys(keys_ws, new_keys_buffer)
+        if new_keys_buf:
+            append_keys_and_update_marker(keys_ws, new_keys_buf)
     else:
         if batch_rows:
             append_rows_safe(master_tickets, batch_rows, "RAW")
-            append_keys(keys_ws, new_keys_buffer)
+            append_keys_and_update_marker(keys_ws, new_keys_buf)
             total_appended += len(batch_rows)
 
     return total_appended, total_scanned
@@ -310,7 +322,6 @@ def main():
     master = gc.open_by_key(MASTER_SPREADSHEET_ID)
 
     tickets_ws = master.worksheet(MASTER_TICKETS_TAB)
-    # ensure Tickets has enough columns (pad safety)
     if tickets_ws.col_count < MASTER_WIDTH_MIN:
         tickets_ws.resize(tickets_ws.row_count or 3, MASTER_WIDTH_MIN)
     master_width = max(tickets_ws.col_count, MASTER_WIDTH_MIN)
