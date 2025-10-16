@@ -1,4 +1,4 @@
-name: Ticket Central Sync (writeback dedupe)
+name: Ticket Central Sync (writeback dedupe + retry-safe)
 
 on:
   workflow_dispatch:
@@ -26,24 +26,30 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Run sync
+
+      - name: Run sync (retry-safe)
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           MASTER_SPREADSHEET_ID: ${{ secrets.MASTER_SPREADSHEET_ID }}
           MASTER_TICKETS_TAB: ${{ vars.MASTER_TICKETS_TAB || 'Tickets' }}
-          MASTER_SOURCE_TAB:  ${{ vars.MASTER_SOURCE_TAB  || 'Source'  }}
+          MASTER_SOURCE_TAB: ${{ vars.MASTER_SOURCE_TAB || 'Source' }}
           TAIL_WINDOW_ROWS: "3000"
           PAGE_ROWS: "3000"
           BATCH_APPEND_ROWS: "500"
           BACKOFF_BASE_SEC: "0.8"
           BACKOFF_MAX_SEC: "6.0"
           START_FROM_NOW: ${{ github.event.inputs.startFromNow || 'false' }}
-          # Optional: choose where to place the sync flag
           SYNC_COL_ALL: "30"
-          SYNC_COL_LI:  "30"
+          SYNC_COL_LI: "30"
         run: |
-          python sync.py
+          for i in 1 2 3; do
+            python sync.py && exit 0
+            echo "Run failed (attempt $i). Retrying after 45s..."
+            sleep 45
+          done
+          exit 1
