@@ -162,24 +162,51 @@ def get_or_create_keys_tab(ss: gspread.Spreadsheet, name: str):
     ws = get_ws(ss, name)
     if ws is None:
         ws = ss.add_worksheet(name, rows=100, cols=2)
-        # A: key, B1: last_row marker
-        ensure_headers(ws, ["key", "last_row"])
-        ws.update(values=[["", "1"]], range_name="A2:B2")  # set initial last_row marker row
+        ensure_headers(ws, ["key", "last_row"])       # A1, B1
+        ws.update(values=[["", "1"]], range_name="A2:B2")  # B2=1 marker
+        return ws
+
+    # --- auto-upgrade existing 1-column tabs ---
+    if ws.col_count < 2:
+        ws.resize(max(ws.row_count, 100), 2)
+
+    # ensure header row present
+    hdr = ws.get("A1:B1") or []
+    a1 = (hdr[0][0] if len(hdr) >= 1 and len(hdr[0]) >= 1 else "").strip()
+    b1 = (hdr[0][1] if len(hdr) >= 1 and len(hdr[0]) >= 2 else "").strip()
+    if a1 != "key" or b1 != "last_row":
+        ws.update(values=[["key", "last_row"]], range_name="A1:B1")
+
+    # ensure marker B2 exists and is an int
+    rng = ws.get("B2:B2")
+    b2 = (rng[0][0] if rng and rng[0] else "").strip()
+    if not b2.isdigit():
+        # compute last_row as current last non-empty row in col A (small read)
+        col_a = ws.col_values(1)
+        last = max(1, len([v for v in col_a if v]))  # includes header
+        ws.update(values=[[str(last)]], range_name="B2:B2")
+
     return ws
 
+
 def get_keys_last_row(keys_ws) -> int:
-    """
-    Read tiny last_row marker from B1 (or B2 fallback).
-    This is a single-cell read, not a full column.
-    """
-    rng = keys_ws.get("B1:B2")  # tiny range; B1 = header, B2 = number cell
-    last_row = 1
+    # guarantee 2 columns
+    if keys_ws.col_count < 2:
+        keys_ws.resize(max(keys_ws.row_count, 100), 2)
+        keys_ws.update(values=[["key", "last_row"]], range_name="A1:B1")
+        keys_ws.update(values=[["", "1"]], range_name="A2:B2")
+        return 1
+
+    rng = keys_ws.get("B2:B2")  # tiny single cell
     try:
-        if len(rng) >= 2 and len(rng[1]) >= 1 and rng[1][0].strip():
-            last_row = int(rng[1][0])
+        if rng and rng[0] and rng[0][0].strip().isdigit():
+            return max(1, int(rng[0][0].strip()))
     except Exception:
-        last_row = 1
-    return max(1, last_row)
+        pass
+    # fallback: compute from col A (still small for key tabs)
+    col_a = keys_ws.col_values(1)
+    return max(1, len([v for v in col_a if v]))
+
 
 def set_keys_last_row(keys_ws, last_row: int):
     keys_ws.update(values=[[str(last_row)]], range_name="B2:B2")
@@ -201,11 +228,13 @@ def load_keys_tail(keys_ws, tail: int) -> Set[str]:
 def append_keys_and_update_marker(keys_ws, new_keys: List[str]):
     if not new_keys:
         return
-    start_marker = get_keys_last_row(keys_ws)
+    # current marker
+    last_row = get_keys_last_row(keys_ws)
     rows = [[k] for k in new_keys]
     append_rows_safe(keys_ws, rows, "RAW")
-    # Update marker: new last row = old marker + len(added rows)
-    set_keys_last_row(keys_ws, start_marker + len(rows))
+    # new last row = old last + count appended
+    keys_ws.update(values=[[str(last_row + len(rows))]], range_name="B2:B2")
+
 
 # ====== MASTER SOURCE LIST ======
 def get_source_ids(master: gspread.Spreadsheet) -> List[str]:
