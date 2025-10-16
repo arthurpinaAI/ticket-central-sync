@@ -1,21 +1,24 @@
-name: Ticket Central Sync (Zapier composite-key)
+name: Ticket Central Sync (per-source keys, tail window)
 
 on:
   workflow_dispatch:
     inputs:
       startFromNow:
-        description: "Baseline current rows as 'seen' (skip history this run)"
+        description: "Baseline current rows in each source (__SyncedKeys_*), skip history this run"
         required: false
         default: "false"
   schedule:
-  # 07:00 IST (01:30 UTC)
-  - cron: "30 1 * * *"
+    # 07:00 IST (01:30 UTC)
+    - cron: "30 1 * * *"
 
+concurrency:
+  group: ticket-central-sync
+  cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
@@ -27,20 +30,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Run sync (one-shot)
+      - name: Run sync
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           MASTER_SPREADSHEET_ID: ${{ secrets.MASTER_SPREADSHEET_ID }}
           MASTER_TICKETS_TAB: ${{ vars.MASTER_TICKETS_TAB || 'Tickets' }}
           MASTER_SOURCE_TAB:  ${{ vars.MASTER_SOURCE_TAB  || 'Source'  }}
-          __MARKERS_TAB_NAME: ${{ vars.MARKERS_TAB_NAME   || '__Markers' }}
-          __KEYINDEX_TAB_NAME: ${{ vars.__KEYINDEX_TAB_NAME || '__KeyIndex' }}
-          # Optional tuning
-          PAGE_ROWS: "5000"
+          # Tail window and batching (defaults are safe)
+          TAIL_WINDOW_ROWS: "3000"
+          PAGE_ROWS: "3000"
           BATCH_APPEND_ROWS: "500"
           BACKOFF_BASE_SEC: "0.8"
           BACKOFF_MAX_SEC: "6.0"
-          # Start-now flag (true only for the very first run you want to skip history)
           START_FROM_NOW: ${{ github.event.inputs.startFromNow || 'false' }}
         run: |
           python sync.py
