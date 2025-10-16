@@ -3,12 +3,16 @@ import os, sys, json, time, re
 from datetime import datetime, timezone
 import gspread
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError
+
 
 # ─────────────────────────── CONFIG VIA ENV ───────────────────────────
 MASTER_SPREADSHEET_ID = os.environ["MASTER_SPREADSHEET_ID"]               # The master workbook (contains Tickets + Source)
 MASTER_TICKETS_TAB    = os.getenv("MASTER_TICKETS_TAB", "Tickets")
 MASTER_SOURCE_TAB     = os.getenv("MASTER_SOURCE_TAB",  "Source")
 MARKERS_TAB_NAME      = os.getenv("__MARKERS_TAB_NAME", "__Markers")
+THROTTLE_MS = int(os.getenv("THROTTLE_MS", "150"))          # pause between API bursts
+MAX_SOURCES_PER_RUN = int(os.getenv("MAX_SOURCES_PER_RUN", "20"))
 
 # Chunking & safety
 TIME_BUDGET_SEC       = int(os.getenv("TIME_BUDGET_SEC", "330"))          # Each run exits before GH Actions 6m watchdog
@@ -154,6 +158,23 @@ def read_source_list(master, source_tab):
         if v and v.strip():
             urls.append(v.strip())
     return [parse_sheet_id(x) for x in urls]
+def values_get_safe(ws, rng, retries=5, base_delay=0.8):
+    """
+    Read a range with exponential backoff on 429 quota errors.
+    """
+    delay = base_delay
+    for attempt in range(retries):
+        try:
+            return ws.get(rng)
+        except APIError as e:
+            msg = str(e).lower()
+            if "quota exceeded" in msg or "429" in msg:
+                time.sleep(delay)
+                delay = min(delay * 2, 6.0)
+                continue
+            raise
+    # Last attempt raises if it still fails
+    return ws.get(rng)
 
 def get_cursor_key(spreadsheet_id, flow):
     return f"CURSOR::{flow}::{spreadsheet_id}"
@@ -188,17 +209,19 @@ def map_row_to_master(row, mapping, static_map, master_width):
     return out
 
 def read_rows_window(ws, start_row, max_col, from_row_inclusive, limit_rows):
-    """
-    Read a bounded window of rows, clamped to the sheet grid size.
-    Returns (absolute_row_numbers, values_list).
-    """
     sheet_max_rows = ws.row_count
     if from_row_inclusive > sheet_max_rows:
-        return [], []  # nothing to read
+        return [], []
 
     to_row = min(from_row_inclusive + limit_rows - 1, sheet_max_rows)
     if to_row < from_row_inclusive:
         return [], []
+
+    rng = f"{gspread.utils.rowcol_to_a1(from_row_inclusive, 1)}:{gspread.utils.rowcol_to_a1(to_row, max_col)}"
+    vals = values_get_safe(ws, rng)  # <-- uses backoff
+    base_row_numbers = list(range(from_row_inclusive, to_row + 1))
+    return base_row_numbers, vals
+
 
     rng = f"{gspread.utils.rowcol_to_a1(from_row_inclusive, 1)}:{gspread.utils.rowcol_to_a1(to_row, max_col)}"
     vals = ws.get(rng)  # list of lists
@@ -219,16 +242,19 @@ def highest_needed_col(mapping, required_cols, static_map):
 
 
 def get_last_data_row(ws):
-    # Cheap last row detection: use find last non-empty in column A..Z by looking at all values length
-    vals = ws.get_all_values()
-    return len(vals)
+    # Avoids expensive get_all_values(); row_count comes from sheet metadata
+    return ws.row_count
+
 
 def process_flow_for_source(gc, tickets_ws, markers_ws, master_width, spreadsheet_id, flow, time_guard_deadline):
     tab, start_row, required, mapping, statics = get_ws_required_and_mapping(flow)
     # open source
     ss = gc.open_by_key(spreadsheet_id)
     ws = get_ws_by_title(ss, tab)
-    if not ws:
+            # Gentle throttle to stay under per-minute limits
+        if THROTTLE_MS > 0:
+            time.sleep(THROTTLE_MS / 1000.0)
+        if not ws:
         # No such tab: mark as fully processed (cursor to last row) to avoid retry storm
         write_marker(markers_ws, get_cursor_key(spreadsheet_id, flow), start_row-1)
         return 0, 0
@@ -307,7 +333,8 @@ def process_all(gc):
     # Queue progression per flow
     markers = read_markers(markers_ws)
     for flow in (FLOW_ALL, FLOW_LI):
-        qkey = get_queue_key(flow)
+                processed_sources = 0
+                qkey = get_queue_key(flow)
         try:
             start_idx = int(markers.get(qkey, "0"))
         except:
@@ -324,6 +351,9 @@ def process_all(gc):
             total_scanned  += s
             i += 1
             write_marker(markers_ws, qkey, i)  # move queue forward as we finish each source
+            processed_sources += 1
+            if processed_sources >= MAX_SOURCES_PER_RUN:
+                break
 
         print(f"[{flow}] scanned={total_scanned} appended={total_appended} next_source_index={i}/{len(sources)}")
 
