@@ -197,8 +197,16 @@ def read_rows_window(ws, start_row, max_col, from_row_inclusive, limit_rows):
     return base_row_numbers, vals
 
 def highest_needed_col(mapping, required_cols, static_map):
-    # Read only up to highest referenced column index
-    return max([*mapping.keys(), *required_cols, *(static_map.keys()*0 or [0])])
+    """
+    Return the highest source column index we must read.
+    - mapping: source_idx -> dest_idx (source_idx drives the read width)
+    - required_cols: list of source column indices that must be non-empty
+    - static_map: destination-only; doesn't affect source read width
+    """
+    max_src = max(mapping.keys()) if mapping else 1
+    max_req = max(required_cols) if required_cols else 1
+    return max(max_src, max_req)
+
 
 def get_last_data_row(ws):
     # Cheap last row detection: use find last non-empty in column A..Z by looking at all values length
