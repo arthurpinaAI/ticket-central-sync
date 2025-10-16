@@ -1,84 +1,98 @@
 #!/usr/bin/env python3
 """
-Ticket Central – Resumable Multi-Source Google Sheets → Master Tickets appender
-- Two flows: ALL TICKETS (LIVE) and LINKEDIN VIEWS (LIVE)
-- Per-source, per-flow row cursors in __Markers (no duplicates, safe resume)
-- Reads only needed columns and bounded row windows
-- Throttling + exponential backoff to avoid 429 quota errors
-- Time-budgeted; spreads work across frequent cron runs
-- Optional INIT_FROM_NOW to skip history for first-time sources
+Ticket Central — Zapier/Make-style one-shot sync
+
+Behavior:
+- Scans EVERY listed source sheet in one run (no artificial chunk-per-run limits).
+- Two flows per source: "ALL TICKETS (LIVE)" and "LINKEDIN VIEWS (LIVE)".
+- Appends to master Tickets once per NEW ROW using a key-based dedupe index (__KeyIndex).
+- Validates required columns before mapping.
+- Pads rows to master width.
+- Batches reads/writes and uses exponential backoff to survive 429 quota bursts.
+- Safe to run daily on schedule (or manually).
+
+Sheets:
+- Master workbook tabs:
+  * Tickets (destination)
+  * Source (source spreadsheet URLs/IDs in column B from row 2)
+  * __KeyIndex (auto-created; columns: key, flow, source_id)
+  * __Markers (optional, for basic progress info)
+- Source workbooks each contain:
+  * ALL TICKETS (LIVE): header rows=3 (data starts at row 4)
+  * LINKEDIN VIEWS (LIVE): header rows=2 (data starts at row 3)
 """
 
-import os, json, time, re
+import os, json, time, re, hashlib
 from datetime import datetime, timezone
+
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
 
-# ─────────────────────────── CONFIG VIA ENV ───────────────────────────
-MASTER_SPREADSHEET_ID = os.environ["MASTER_SPREADSHEET_ID"]               # Master workbook (has Tickets + Source)
+# -------------------- ENV / CONFIG --------------------
+MASTER_SPREADSHEET_ID = os.environ["MASTER_SPREADSHEET_ID"]
 MASTER_TICKETS_TAB    = os.getenv("MASTER_TICKETS_TAB", "Tickets")
 MASTER_SOURCE_TAB     = os.getenv("MASTER_SOURCE_TAB",  "Source")
 MARKERS_TAB_NAME      = os.getenv("__MARKERS_TAB_NAME", "__Markers")
+KEYINDEX_TAB_NAME     = os.getenv("__KEYINDEX_TAB_NAME","__KeyIndex")
 
-# Chunking & safety
-TIME_BUDGET_SEC       = int(os.getenv("TIME_BUDGET_SEC", "330"))        # < GH job timeout; we exit cleanly
-CHUNK_ROWS_PER_SOURCE = int(os.getenv("CHUNK_ROWS", "800"))             # rows scanned per source per pass
-INIT_FROM_NOW         = os.getenv("INIT_FROM_NOW", "false").lower() in ("1","true","yes")
+# Page/batch sizes (tune if needed)
+PAGE_ROWS             = int(os.getenv("PAGE_ROWS", "5000"))   # rows per read page from a source tab
+BATCH_APPEND_ROWS     = int(os.getenv("BATCH_APPEND_ROWS", "500"))  # rows per append to Tickets/KeyIndex
 
-# Quota-friendly pacing
-THROTTLE_MS           = int(os.getenv("THROTTLE_MS", "200"))            # pause after each chunk
-MAX_SOURCES_PER_RUN   = int(os.getenv("MAX_SOURCES_PER_RUN", "15"))     # limit sources per flow per run
+# Quota-safety (still runs to completion; these only slow down slightly when needed)
+BACKOFF_BASE_SEC      = float(os.getenv("BACKOFF_BASE_SEC", "0.8"))
+BACKOFF_MAX_SEC       = float(os.getenv("BACKOFF_MAX_SEC", "6.0"))
 
-# Source tabs
-TAB_ALL   = "ALL TICKETS (LIVE)"
-TAB_LI    = "LINKEDIN VIEWS (LIVE)"
+# Flow/tab details
+TAB_ALL = "ALL TICKETS (LIVE)"
+TAB_LI  = "LINKEDIN VIEWS (LIVE)"
 
-# Data starts after headers in source sheets
-START_ROW_ALL = 4   # headers = 3 rows (data starts at row 4)
-START_ROW_LI  = 3   # headers = 2 rows (data starts at row 3)
+START_ROW_ALL = 4  # headers = 3 rows
+START_ROW_LI  = 3  # headers = 2 rows
 
-# Validity: required columns must be non-empty (1-based indexes)
-REQ_ALL = [2, 3]       # B, C
-REQ_LI  = [2, 3, 4]    # B, C, D
+# Required non-empty source columns (1-based)
+REQ_ALL = [2, 3]        # B, C
+REQ_LI  = [2, 3, 4]     # B, C, D
 
-# Column mappings: source idx (1-based) -> Tickets idx (1-based)
+# Column mappings: source idx → Tickets idx (both 1-based)
 MAP_ALL = {
-    1: 1,   # A -> A(1)
-    3: 2,   # C -> B(2)
-    10: 5,  # J -> E(5)
-    2: 6,   # B -> F(6)
-    11: 7,  # K -> G(7)
-    12: 8,  # L -> H(8)
-    4: 16,  # D -> P(16)
+    1: 1,    # A(1) -> A(1)
+    3: 2,    # C(3) -> B(2)
+    10: 5,   # J(10)-> E(5)
+    2: 6,    # B(2) -> F(6)
+    11: 7,   # K(11)-> G(7)
+    12: 8,   # L(12)-> H(8)
+    4: 16,   # D(4) -> P(16)
 }
-# LINKEDIN mappings + statics
+
 MAP_LI = {
-    1: 1,  # A -> A(1)
-    2: 6,  # B -> F(6)
-    3: 2,  # C -> B(2)
-    5: 8,  # E -> H(8)
-    4: 3,  # D -> C(3)
+    1: 1,    # A(1) -> A(1)
+    2: 6,    # B(2) -> F(6)
+    3: 2,    # C(3) -> B(2)
+    5: 8,    # E(5) -> H(8)
+    4: 3,    # D(4) -> C(3)
 }
 STATIC_LI = {
-    5: "LinkedIn - LX",  # dest E(5)
-    7: "DD",             # dest G(7)
+    5: "LinkedIn - LX",  # -> E(5) static
+    7: "DD",             # -> G(7) static
 }
 
-# Master width implied by mappings (max destination index). We ensure at least this many columns.
+# Master width (pad to this many columns at minimum)
 MASTER_WIDTH_MIN = max([*MAP_ALL.values(), *MAP_LI.values(), *STATIC_LI.keys(), 16])
 
-# Flow keys for markers
+# Key columns for dedupe (Zapier-style “seen row once”)
+KEYCOLS_ALL = [1, 2, 3]          # A+B+C
+KEYCOLS_LI  = [1, 2, 3, 4]       # A+B+C+D
+
 FLOW_ALL = "ALL"
 FLOW_LI  = "LI"
 
-# ─────────────────────────── AUTH & HELPERS ───────────────────────────
-
-def _now_utc_iso():
+# -------------------- UTILS --------------------
+def now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-
-def auth_client():
+def authorize() -> gspread.Client:
     info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -87,130 +101,30 @@ def auth_client():
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
-
-def ensure_sheet(ws, min_rows=1, min_cols=1):
-    rows, cols = ws.row_count, ws.col_count
-    grow_r = max(0, min_rows - rows)
-    grow_c = max(0, min_cols - cols)
-    if grow_r or grow_c:
-        ws.resize(rows + grow_r if grow_r else rows, cols + grow_c if grow_c else cols)
-
-
-def get_or_create_markers(master):
-    try:
-        ws = master.worksheet(MARKERS_TAB_NAME)
-    except gspread.exceptions.WorksheetNotFound:
-        ws = master.add_worksheet(MARKERS_TAB_NAME, rows=50, cols=3)
-        ws.update(values=[["key","value","updated_at"]], range_name="A1:C1")
-    return ws
-
-
-def read_markers(markers_ws):
-    values = markers_ws.get_all_values()
-    idx = {}
-    for r in values[1:]:
-        if len(r) < 1:
-            continue
-        key = r[0]
-        val = r[1] if len(r) > 1 else ""
-        idx[key] = val
-    return idx
-
-
-def write_marker(markers_ws, key, value):
-    # Upsert by key in col A
-    values = markers_ws.get_all_values()
-    key_to_row = {}
-    for i, r in enumerate(values, start=1):
-        if i == 1:
-            continue
-        if r and r[0] == key:
-            key_to_row[key] = i
-            break
-    ts = _now_utc_iso()
-    if key in key_to_row:
-        row = key_to_row[key]
-        markers_ws.update(values=[[key, str(value), ts]], range_name=f"A{row}:C{row}")
-    else:
-        markers_ws.append_row([key, str(value), ts], value_input_option="RAW")
-
-
-def parse_sheet_id(url_or_id):
+def parse_sheet_id(url_or_id: str) -> str:
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url_or_id)
     return m.group(1) if m else url_or_id.strip()
 
-
-def get_ws_by_title(ss, title):
+def get_ws(ss: gspread.Spreadsheet, title: str):
     try:
         return ss.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
         return None
 
+def ensure_headers(ws, headers, range_a1="A1"):
+    ws.update(values=[headers], range_name=f"{range_a1}:{chr(ord('A')+len(headers)-1)}1")
 
-def get_master_width(tickets_ws):
-    # Prefer actual sheet width; ensure at least mapping minimum.
-    return max(MASTER_WIDTH_MIN, tickets_ws.col_count)
+def ensure_sheet_size(ws, min_rows, min_cols):
+    if ws.row_count < min_rows or ws.col_count < min_cols:
+        ws.resize(max(ws.row_count, min_rows), max(ws.col_count, min_cols))
 
+def highest_needed_col(mapping, required_cols):
+    m = max(mapping.keys()) if mapping else 1
+    r = max(required_cols) if required_cols else 1
+    return max(m, r)
 
-def read_source_list(master, source_tab):
-    ws = master.worksheet(source_tab)
-    col_b = ws.col_values(2)  # Column B
-    urls = []
-    for i, v in enumerate(col_b, start=1):
-        if i < 2:   # row 1 header; row 2+ are URLs
-            continue
-        if v and v.strip():
-            urls.append(v.strip())
-    return [parse_sheet_id(x) for x in urls]
-
-
-def get_cursor_key(spreadsheet_id, flow):
-    return f"CURSOR::{flow}::{spreadsheet_id}"
-
-
-def get_queue_key(flow):
-    return f"SYNC_CURSOR_{flow}"
-
-
-def get_ws_required_and_mapping(flow):
-    if flow == FLOW_ALL:
-        return TAB_ALL, START_ROW_ALL, REQ_ALL, MAP_ALL, {}
-    else:
-        return TAB_LI, START_ROW_LI, REQ_LI, MAP_LI, STATIC_LI
-
-
-def is_row_valid(row, required_cols):
-    # row is 0-based list; required_cols are 1-based
-    for idx in required_cols:
-        val = row[idx-1] if idx-1 < len(row) else ""
-        if str(val).strip() == "":
-            return False
-    return True
-
-
-def map_row_to_master(row, mapping, static_map, master_width):
-    out = [""] * master_width
-    # statics first
-    for dest_idx, sval in static_map.items():
-        if 1 <= dest_idx <= master_width:
-            out[dest_idx-1] = sval
-    # mapped fields
-    for src_idx, dest_idx in mapping.items():
-        if 1 <= dest_idx <= master_width:
-            val = row[src_idx-1] if src_idx-1 < len(row) else ""
-            out[dest_idx-1] = val
-    return out
-
-
-def highest_needed_col(mapping, required_cols, _static_map_unused):
-    max_src = max(mapping.keys()) if mapping else 1
-    max_req = max(required_cols) if required_cols else 1
-    return max(max_src, max_req)
-
-
-def values_get_safe(ws, rng, retries=5, base_delay=0.8):
-    """Read a range with exponential backoff on 429 quota errors."""
-    delay = base_delay
+def values_get_safe(ws, rng, retries=6):
+    delay = BACKOFF_BASE_SEC
     for _ in range(retries):
         try:
             return ws.get(rng)
@@ -218,165 +132,214 @@ def values_get_safe(ws, rng, retries=5, base_delay=0.8):
             msg = str(e).lower()
             if "quota exceeded" in msg or "429" in msg:
                 time.sleep(delay)
-                delay = min(delay * 2, 6.0)
+                delay = min(delay * 2, BACKOFF_MAX_SEC)
                 continue
             raise
     return ws.get(rng)
 
+def append_rows_safe(ws, rows, value_input_option="RAW", retries=6):
+    delay = BACKOFF_BASE_SEC
+    for _ in range(retries):
+        try:
+            ws.append_rows(rows, value_input_option=value_input_option)
+            return
+        except APIError as e:
+            msg = str(e).lower()
+            if "quota exceeded" in msg or "429" in msg:
+                time.sleep(delay)
+                delay = min(delay * 2, BACKOFF_MAX_SEC)
+                continue
+            raise
+    ws.append_rows(rows, value_input_option=value_input_option)
 
-def read_rows_window(ws, start_row, max_col, from_row_inclusive, limit_rows):
-    """Read a bounded window of rows, clamped to the sheet grid size (rows & cols)."""
-    sheet_max_rows = ws.row_count
-    sheet_max_cols = ws.col_count
-    if from_row_inclusive > sheet_max_rows:
-        return [], []
+def map_row_to_master(row, mapping, statics, width):
+    out = [""] * width
+    # statics
+    for dest_idx, sval in statics.items():
+        if 1 <= dest_idx <= width:
+            out[dest_idx-1] = sval
+    # mapped fields
+    for src_idx, dest_idx in mapping.items():
+        if 1 <= dest_idx <= width:
+            out[dest_idx-1] = row[src_idx-1] if src_idx-1 < len(row) else ""
+    return out
 
-    to_row = min(from_row_inclusive + limit_rows - 1, sheet_max_rows)
-    if to_row < from_row_inclusive:
-        return [], []
+def make_key(row, keycols):
+    parts = [(row[i-1] if i-1 < len(row) else "").strip() for i in keycols]
+    blob = "\u241f".join(parts)  # unit separator
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
-    eff_max_col = min(max_col, sheet_max_cols)
-    rng = f"{gspread.utils.rowcol_to_a1(from_row_inclusive, 1)}:{gspread.utils.rowcol_to_a1(to_row, eff_max_col)}"
-    vals = values_get_safe(ws, rng)
-    base_row_numbers = list(range(from_row_inclusive, to_row + 1))
-    return base_row_numbers, vals
+def load_seen_keys(key_ws):
+    # Reads entire key column (A). If this grows huge (millions), consider sharding later.
+    seen = set()
+    col = key_ws.col_values(1)
+    for idx, v in enumerate(col, start=1):
+        if idx == 1:
+            continue  # header
+        if v:
+            seen.add(v)
+    return seen
 
+def write_marker(markers_ws, key, value):
+    # Upsert by key in __Markers (A=key, B=value, C=updated_at)
+    values = markers_ws.get_all_values()
+    row_found = None
+    for i, r in enumerate(values, start=1):
+        if i == 1:
+            continue
+        if r and r[0] == key:
+            row_found = i
+            break
+    ts = now_utc()
+    if row_found:
+        markers_ws.update(values=[[key, str(value), ts]], range_name=f"A{row_found}:C{row_found}")
+    else:
+        markers_ws.append_row([key, str(value), ts], value_input_option="RAW")
 
-# ─────────────────────────── CORE PROCESSING ───────────────────────────
+# -------------------- CORE --------------------
+def get_source_ids(master):
+    ws = master.worksheet(MASTER_SOURCE_TAB)
+    col_b = ws.col_values(2)
+    ids = []
+    for i, v in enumerate(col_b, start=1):
+        if i < 2:
+            continue
+        if v and v.strip():
+            ids.append(parse_sheet_id(v.strip()))
+    return ids
 
-def process_flow_for_source(gc, tickets_ws, markers_ws, master_width, spreadsheet_id, flow, time_guard_deadline):
-    tab, start_row, required, mapping, statics = get_ws_required_and_mapping(flow)
-    # open source
+def ensure_admin_tabs(master):
+    # __KeyIndex
+    try:
+        key_ws = master.worksheet(KEYINDEX_TAB_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        key_ws = master.add_worksheet(KEYINDEX_TAB_NAME, rows=100, cols=3)
+        ensure_headers(key_ws, ["key", "flow", "source_id"], "A1")
+    # __Markers
+    try:
+        mk_ws = master.worksheet(MARKERS_TAB_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        mk_ws = master.add_worksheet(MARKERS_TAB_NAME, rows=50, cols=3)
+        ensure_headers(mk_ws, ["key", "value", "updated_at"], "A1")
+    return key_ws, mk_ws
+
+def process_flow_for_source(gc, tickets_ws, key_ws, markers_ws, master_width,
+                            spreadsheet_id, flow):
+    # Flow config
+    if flow == FLOW_ALL:
+        tab = TAB_ALL
+        start_row = START_ROW_ALL
+        required = REQ_ALL
+        mapping = MAP_ALL
+        statics = {}
+        keycols = KEYCOLS_ALL
+    else:
+        tab = TAB_LI
+        start_row = START_ROW_LI
+        required = REQ_LI
+        mapping = MAP_LI
+        statics = STATIC_LI
+        keycols = KEYCOLS_LI
+
+    # Open source sheet/tab
     ss = gc.open_by_key(spreadsheet_id)
-    ws = get_ws_by_title(ss, tab)
+    ws = get_ws(ss, tab)
     if not ws:
-        # No such tab: mark as fully processed to avoid retry storms
-        write_marker(markers_ws, get_cursor_key(spreadsheet_id, flow), start_row - 1)
+        # no such tab — just mark and move on
+        write_marker(markers_ws, f"CURSOR::{flow}::{spreadsheet_id}", f"NO_TAB:{tab}")
         return 0, 0
 
-    # Initialize cursor
-    markers = read_markers(markers_ws)
-    ckey = get_cursor_key(spreadsheet_id, flow)
-    cursor = markers.get(ckey)
-    if cursor is None or cursor == "":
-        if INIT_FROM_NOW:
-            # Skip history: use grid row_count as last processed
-            cursor_val = max(start_row - 1, ws.row_count)
-        else:
-            cursor_val = start_row - 1
-        write_marker(markers_ws, ckey, cursor_val)
-        cursor = str(cursor_val)
-    last_done = int(cursor)
+    # Prepare read bounds
+    max_col_needed = highest_needed_col(mapping, required)
+    max_col = min(max_col_needed, ws.col_count)
+    max_row = ws.row_count
 
-    # Highest needed source column for efficient reads
-    max_col = highest_needed_col(mapping, required, statics)
-    appended = 0
-    scanned = 0
+    # Preload seen keys (Zapier-style dedupe)
+    seen = load_seen_keys(key_ws)
 
-    while time.time() < time_guard_deadline:
-        from_row = last_done + 1
-        base_rows, raw = read_rows_window(ws, start_row, max_col, from_row, CHUNK_ROWS_PER_SOURCE)
-        if not raw:
-            break
+    total_appended = 0
+    total_scanned = 0
+    batch_rows = []
+    batch_keys = []
 
-        to_append = []
-        for idx, row in enumerate(raw):
-            absolute_row = base_rows[idx]
-            scanned += 1
-            if absolute_row < start_row:
-                last_done = absolute_row
-                continue
-            if is_row_valid(row, required):
-                out = map_row_to_master(row, mapping, statics, master_width)
-                to_append.append(out)
-            last_done = absolute_row
+    # Page through the ENTIRE sheet (one run), but only up to max needed columns
+    r = start_row
+    while r <= max_row:
+        page_end = min(r + PAGE_ROWS - 1, max_row)
+        rng = f"{gspread.utils.rowcol_to_a1(r, 1)}:{gspread.utils.rowcol_to_a1(page_end, max_col)}"
+        values = values_get_safe(ws, rng)  # list of lists
+        # values list length can be shorter than (page_end - r + 1) for trailing blanks; compute absolute row per item
+        for i, row in enumerate(values):
+            abs_row = r + i
+            total_scanned += 1
 
-        if to_append:
-            # append_rows may also 429; retry lightly
-            delay = 0.8
-            for _ in range(5):
-                try:
-                    tickets_ws.append_rows(to_append, value_input_option="RAW")
-                    appended += len(to_append)
+            # validity
+            ok = True
+            for req_idx in required:
+                if (req_idx - 1) >= len(row) or str(row[req_idx - 1]).strip() == "":
+                    ok = False
                     break
-                except APIError as e:
-                    msg = str(e).lower()
-                    if "quota exceeded" in msg or "429" in msg:
-                        time.sleep(delay)
-                        delay = min(delay * 2, 6.0)
-                        continue
-                    raise
+            if not ok:
+                continue
 
-        # Update cursor after each chunk
-        write_marker(markers_ws, ckey, last_done)
+            # Key & dedupe
+            k = make_key(row, keycols)
+            if k in seen:
+                continue
 
-        # Gentle throttle to stay under per-minute limits
-        if THROTTLE_MS > 0:
-            time.sleep(THROTTLE_MS / 1000.0)
+            out = map_row_to_master(row, mapping, statics, master_width)
+            batch_rows.append(out)
+            batch_keys.append([k, flow, spreadsheet_id])
+            seen.add(k)
 
-        # If fewer than chunk came back, likely end of sheet
-        if len(raw) < CHUNK_ROWS_PER_SOURCE:
-            break
+            # Append in batches to reduce API calls
+            if len(batch_rows) >= BATCH_APPEND_ROWS:
+                append_rows_safe(tickets_ws, batch_rows, value_input_option="RAW")
+                append_rows_safe(key_ws,     batch_keys, value_input_option="RAW")
+                total_appended += len(batch_rows)
+                batch_rows.clear()
+                batch_keys.clear()
 
-    return appended, scanned
+        r = page_end + 1
 
+    # Flush remaining
+    if batch_rows:
+        append_rows_safe(tickets_ws, batch_rows, value_input_option="RAW")
+        append_rows_safe(key_ws,     batch_keys, value_input_option="RAW")
+        total_appended += len(batch_rows)
 
-def process_all(gc):
-    t0 = time.time()
-    deadline = t0 + TIME_BUDGET_SEC
+    # Write a marker so you can see it finished this tab
+    write_marker(markers_ws, f"CURSOR::{flow}::{spreadsheet_id}", f"DONE:{max_row}")
 
-    master = gc.open_by_key(MASTER_SPREADSHEET_ID)
-    tickets_ws = master.worksheet(MASTER_TICKETS_TAB)
-    source_ws  = master.worksheet(MASTER_SOURCE_TAB)
-    markers_ws = get_or_create_markers(master)
-
-    # Ensure minimal shape for Tickets & Markers
-    ensure_sheet(tickets_ws, min_rows=3, min_cols=MASTER_WIDTH_MIN)
-    ensure_sheet(markers_ws, min_rows=5, min_cols=3)
-
-    master_width = get_master_width(tickets_ws)
-    sources = read_source_list(master, MASTER_SOURCE_TAB)
-    if not sources:
-        print("No sources found in Source!B2:B — nothing to do.")
-        return
-
-    # Process each flow with queue progression
-    for flow in (FLOW_ALL, FLOW_LI):
-        markers = read_markers(markers_ws)
-        qkey = get_queue_key(flow)
-        try:
-            start_idx = int(markers.get(qkey, "0"))
-        except Exception:
-            start_idx = 0
-
-        i = start_idx
-        total_appended = 0
-        total_scanned = 0
-        processed_sources = 0
-
-        while time.time() < deadline and i < len(sources):
-            sid = sources[i]
-            a, s = process_flow_for_source(gc, tickets_ws, markers_ws, master_width, sid, flow, deadline)
-            total_appended += a
-            total_scanned  += s
-            i += 1
-            write_marker(markers_ws, qkey, i)  # move queue forward per completed source
-
-            processed_sources += 1
-            if processed_sources >= MAX_SOURCES_PER_RUN:
-                break
-
-        print(f"[{flow}] scanned={total_scanned} appended={total_appended} next_source_index={i}/{len(sources)}")
-
-        # If finished all sources for this flow, wrap to 0 for next run
-        if i >= len(sources):
-            write_marker(markers_ws, qkey, 0)
-
+    return total_appended, total_scanned
 
 def main():
-    gc = auth_client()
-    process_all(gc)
+    gc = authorize()
+    master = gc.open_by_key(MASTER_SPREADSHEET_ID)
+    tickets_ws = master.worksheet(MASTER_TICKETS_TAB)
 
+    # Ensure master width (pad safety)
+    ensure_sheet_size(tickets_ws, min_rows=3, min_cols=MASTER_WIDTH_MIN)
+    master_width = max(tickets_ws.col_count, MASTER_WIDTH_MIN)
+
+    key_ws, markers_ws = ensure_admin_tabs(master)
+    sources = get_source_ids(master)
+    if not sources:
+        print("No sources in Source!B2:B — nothing to do.")
+        return
+
+    grand_app = grand_scan = 0
+    for flow in (FLOW_ALL, FLOW_LI):
+        flow_app = flow_scan = 0
+        for sid in sources:
+            a, s = process_flow_for_source(gc, tickets_ws, key_ws, markers_ws, master_width, sid, flow)
+            flow_app += a
+            flow_scan += s
+        print(f"[{flow}] scanned={flow_scan} appended={flow_app}")
+        grand_app += flow_app
+        grand_scan += flow_scan
+
+    print(f"[ALL FLOWS DONE] scanned={grand_scan} appended={grand_app}")
 
 if __name__ == "__main__":
     main()
