@@ -11,6 +11,7 @@ MASTER_SPREADSHEET_ID = os.environ["MASTER_SPREADSHEET_ID"]
 MASTER_TAB            = os.environ.get("MASTER_TAB", "Tickets")
 SOURCE_SPREADSHEET_ID = os.environ["SOURCE_SPREADSHEET_ID"]
 SOURCE_TAB            = os.environ.get("SOURCE_TAB", "Source")
+MASTER_HEADER_ROWS = int(os.environ.get("MASTER_HEADER_ROWS", "3"))  # keep first 3 rows
 
 # Source tab names in each source spreadsheet
 ALL_TAB = os.environ.get("ALL_TAB", "ALL TICKETS (LIVE)")
@@ -140,6 +141,42 @@ def ensure_master_tab(master_id: str, tab_name: str):
         return sh.worksheet(tab_name)
     except gspread.exceptions.WorksheetNotFound:
         return sh.add_worksheet(title=tab_name, rows=1000, cols=50)
+from googleapiclient.discovery import build
+
+def ensure_master_tab_and_headers(master_id: str, tab_name: str, header_rows: int):
+    """Make sure the master tab exists and has at least `header_rows` rows filled (even if blank)."""
+    sh = gc.open_by_key(master_id)
+    try:
+        ws = sh.worksheet(tab_name)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=tab_name, rows=max(1000, header_rows+100), cols=50)
+    # Ensure at least header_rows physically exist (Google Sheets treats empty as existing rows,
+    # but to be safe we write blanks up to header_rows if the sheet is brand new)
+    cur_last = len(ws.get_all_values())
+    if cur_last < header_rows:
+        blanks = [[""] * 1] * (header_rows - cur_last)
+        # write a no-op range to create visible rows
+        sheets_v4.spreadsheets().values().append(
+            spreadsheetId=master_id,
+            range=f"{tab_name}!A1",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": blanks},
+        ).execute()
+    return ws
+
+def append_rows_after_headers(master_id: str, tab: str, rows: List[List[Any]], header_rows: int):
+    if not rows:
+        return
+    # Appending with the API always inserts below the current last content.
+    # We only need to guarantee there are at least `header_rows` rows before first append.
+    sheets_v4.spreadsheets().values().append(
+        spreadsheetId=master_id,
+        range=f"{tab}!A1",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={"values": rows},
+    ).execute()
 
 def build_mapped_row(mapping: List[Dict[str, Any]], src_row: List[Any], width: int) -> List[Any]:
     out = [""] * width
@@ -219,7 +256,7 @@ def process_flow(flow_name: str,
     start_ts = time.time()
     markers = read_markers(markers_ws)
     # Determine master width
-    master_ws = ensure_master_tab(master_id, master_tab)
+    master_ws = ensure_master_tab_and_headers(master_id, master_tab, MASTER_HEADER_ROWS)
     master_values = master_ws.get_all_values()
     master_width = max(len(master_values[0]) if master_values else 0, max_tgt(mapping))
     need_cols = need_src_cols(mapping, required_cols)
@@ -261,7 +298,7 @@ def process_flow(flow_name: str,
                 out_rows.append(mapped)
             cur += take
         if out_rows:
-            append_rows(master_id, master_tab, out_rows)
+            append_rows_after_headers(master_id, master_tab, out_rows, MASTER_HEADER_ROWS)
             total_added += len(out_rows)
             prev = prev + rows_to_read  # marker moves to last row inspected (even if some skipped)
             set_markers(markers_ws, {key: str(prev)})
