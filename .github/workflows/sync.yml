@@ -1,61 +1,97 @@
-name: Ticket Central Sync (writeback dedupe + retry-safe)
+name: Ticket Central Sync (final, sharded)
 
 on:
   workflow_dispatch:
     inputs:
       startFromNow:
-        description: "Stamp sync flags now (skip history this run)"
+        description: "Stamp sync flags (skip history this run)"
         required: false
         default: "false"
   schedule:
     # 07:00 IST (01:30 UTC)
     - cron: "30 1 * * *"
+    # 07:10 IST (01:40 UTC) - second shard
+    - cron: "40 1 * * *"
 
 concurrency:
   group: ticket-central-sync
   cancel-in-progress: false
 
 jobs:
-  sync:
+  shard0:
+    if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    permissions:
-      contents: read
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Run sync (retry-safe)
+      - name: Run sync shard 0 (retry wrapper)
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           MASTER_SPREADSHEET_ID: ${{ secrets.MASTER_SPREADSHEET_ID }}
-          MASTER_TICKETS_TAB: ${{ vars.MASTER_TICKETS_TAB || 'Tickets' }}
-          MASTER_SOURCE_TAB: ${{ vars.MASTER_SOURCE_TAB || 'Source' }}
-          TAIL_WINDOW_ROWS: "2000"
-          THROTTLE_MS_PER_READ: "250"        # sleep 0.25s after each range GET
-          SLEEP_BETWEEN_SOURCES_MS: "1000"   # sleep 1s after each source
-          SLEEP_BETWEEN_FLOWS_MS: "3000"     # sleep 3s between ALL and LI passes
-# Optional source sharding (split across multiple runs if needed)
-          TOTAL_SHARDS: "1"                  # set to 2 or 3 to split sources
-          SHARD_INDEX: "0"                   # 0..TOTAL_SHARDS-1; run different shards at different times
-          PAGE_ROWS: "100000"
-          BATCH_APPEND_ROWS: "500"
-          BACKOFF_BASE_SEC: "2.0"
-          BACKOFF_MAX_SEC: "20.0"
+          # tuning knobs
+          TAIL_WINDOW_ROWS: ${{ vars.TAIL_WINDOW_ROWS || '3000' }}
+          PAGE_ROWS: ${{ vars.PAGE_ROWS || '3000' }}
+          BATCH_APPEND_ROWS: ${{ vars.BATCH_APPEND_ROWS || '500' }}
+          THROTTLE_MS_PER_READ: ${{ vars.THROTTLE_MS_PER_READ || '250' }}
+          SLEEP_BETWEEN_SOURCES_MS: ${{ vars.SLEEP_BETWEEN_SOURCES_MS || '1000' }}
+          SLEEP_BETWEEN_FLOWS_MS: ${{ vars.SLEEP_BETWEEN_FLOWS_MS || '3000' }}
+          BACKOFF_BASE_SEC: ${{ vars.BACKOFF_BASE_SEC || '0.8' }}
+          BACKOFF_MAX_SEC: ${{ vars.BACKOFF_MAX_SEC || '20.0' }}
+          TOTAL_SHARDS: "2"
+          SHARD_INDEX: "0"
           START_FROM_NOW: ${{ github.event.inputs.startFromNow || 'false' }}
-          SYNC_COL_ALL: "30"
-          SYNC_COL_LI: "30"
+          SYNC_COL_ALL: ${{ vars.SYNC_COL_ALL || '30' }}
+          SYNC_COL_LI: ${{ vars.SYNC_COL_LI || '30' }}
         run: |
           for i in 1 2 3; do
             python sync.py && exit 0
-            echo "Run failed (attempt $i). Retrying after 45s..."
+            echo "sync.py failed (attempt $i). Sleeping then retrying..."
+            sleep 45
+          done
+          exit 1
+
+  shard1:
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run sync shard 1 (retry wrapper)
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          MASTER_SPREADSHEET_ID: ${{ secrets.MASTER_SPREADSHEET_ID }}
+          TAIL_WINDOW_ROWS: ${{ vars.TAIL_WINDOW_ROWS || '3000' }}
+          PAGE_ROWS: ${{ vars.PAGE_ROWS || '3000' }}
+          BATCH_APPEND_ROWS: ${{ vars.BATCH_APPEND_ROWS || '500' }}
+          THROTTLE_MS_PER_READ: ${{ vars.THROTTLE_MS_PER_READ || '250' }}
+          SLEEP_BETWEEN_SOURCES_MS: ${{ vars.SLEEP_BETWEEN_SOURCES_MS || '1000' }}
+          SLEEP_BETWEEN_FLOWS_MS: ${{ vars.SLEEP_BETWEEN_FLOWS_MS || '3000' }}
+          BACKOFF_BASE_SEC: ${{ vars.BACKOFF_BASE_SEC || '0.8' }}
+          BACKOFF_MAX_SEC: ${{ vars.BACKOFF_MAX_SEC || '20.0' }}
+          TOTAL_SHARDS: "2"
+          SHARD_INDEX: "1"
+          START_FROM_NOW: ${{ github.event.inputs.startFromNow || 'false' }}
+          SYNC_COL_ALL: ${{ vars.SYNC_COL_ALL || '30' }}
+          SYNC_COL_LI: ${{ vars.SYNC_COL_LI || '30' }}
+        run: |
+          # run shard 1 ten minutes later on schedule; but for manual runs both shards run.
+          for i in 1 2 3; do
+            python sync.py && exit 0
+            echo "sync.py failed (attempt $i). Sleeping then retrying..."
             sleep 45
           done
           exit 1
